@@ -1,0 +1,805 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Elaticsearch service with coginito for role based authentication. Cloudwatch logs will be sent to Elasticsearch with Lambda subscription filter. For sizing the domain, refer - https://docs.aws.amazon.com/elasticsearch-service/latest/developerguide/sizing-domains.html#aes-bp-instances",
+  "Parameters": {
+    "ESDomainName": {
+      "Type": "String",
+      "Description": "Provide the Elasticsearch domain name. eg: dev-es"
+    },
+    "CognitoDomainName": {
+      "Type": "String",
+      "Description": "Provide the Cognito domain name. Domain names can only contain lower-case letters, numbers, and hyphens. eg: devcognito"
+    },
+    "DataNodeInstanceType": {
+      "Type": "String",
+      "Description": "Provide the instance type for data nodes. Refer - https://docs.aws.amazon.com/elasticsearch-service/latest/developerguide/sizing-domains.html#aes-bp-instances. To view all the instance types, refer - https://aws.amazon.com/elasticsearch-service/pricing/"
+    },
+    "DataNodeCount": {
+      "Type": "String",
+      "Description": "Provide the number of data nodes. For high availability, enter a value 2 or above"
+    },
+    "MasterNodeInstanceType": {
+      "Type": "String",
+      "Description": "Provide the instance type for Master nodes. For more info, refer -https://docs.aws.amazon.com/elasticsearch-service/latest/developerguide/es-managedomains-dedicatedmasternodes.html"
+    },
+    "MasterNodeCount": {
+      "Type": "String",
+      "Description": "Provide the number of Master nodes.For more info, refer -https://docs.aws.amazon.com/elasticsearch-service/latest/developerguide/es-managedomains-dedicatedmasternodes.html",
+      "AllowedValues": [
+        "3",
+        "5",
+        "7"
+      ],
+      "Default": "3"
+    },
+    "EBSVol": {
+      "Type": "Number",
+      "Default": "20",
+      "Description": "Enter the EBS volume for data nodes in GB. If you enter 20 and there are 2 data nodes, total EBS volumes will be 40GB."
+    },
+    "IOPS": {
+      "Type": "Number",
+      "Default": "0",
+      "Description": "Replace 0 if need to provision IOPS."
+    },
+    "ElasticsearchVersion": {
+      "Type": "String",
+      "Default": "7.9",
+      "Description": "Enter the Elasticsearch version. Refer -https://docs.aws.amazon.com/elasticsearch-service/latest/developerguide/what-is-amazon-elasticsearch-service.html#aes-choosing-version"
+    },
+    "AdminEmail": {
+      "Type": "String",
+      "Description": "Enter the email id for the Elasticsearch admin user"
+    },
+    "readonlyEmail": {
+      "Type": "String",
+      "Description": "Enter the email id for the Elasticsearch readonly user"
+    },
+    "CloudwatchLogGroup": {
+      "Type": "String",
+      "Description": "Enter Cloudwatch Log Group Name"
+    },
+    "LambdaArtifactBucketName": {
+      "Type": "String",
+      "Description": "Enter S3 bucket where lambda function zip is stored/"
+    },
+    "LambdaArtifactName": {
+      "Description": "The name of the lambda zipped file",
+      "Type": "String",
+      "Default": "LogsToElasticsearch.zip"
+    },
+    "indexName": {
+      "Description": "The name of the index to be created in Elasticsearc",
+      "Type": "String",
+      "Default": "logs"
+    }
+  },
+  "Resources": {
+    "CognitoAuthRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "es.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Sub": "Cognito_${CognitoDomainName}-identitypoolAuth_Role"
+            },
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "cognito-idp:DescribeUserPool",
+                    "cognito-idp:CreateUserPoolClient",
+                    "cognito-idp:DeleteUserPoolClient",
+                    "cognito-idp:DescribeUserPoolClient",
+                    "cognito-idp:AdminInitiateAuth",
+                    "cognito-idp:AdminUserGlobalSignOut",
+                    "cognito-idp:ListUserPoolClients",
+                    "cognito-identity:DescribeIdentityPool",
+                    "cognito-identity:UpdateIdentityPool",
+                    "cognito-identity:SetIdentityPoolRoles",
+                    "cognito-identity:GetIdentityPoolRoles"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": "*",
+                  "Condition": {
+                    "StringLike": {
+                      "iam:PassedToService": "cognito-identity.amazonaws.com"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:GetRole",
+                    "iam:PassRole",
+                    "iam:CreateRole",
+                    "iam:AttachRolePolicy",
+                    "ec2:DescribeVpcs",
+                    "cognito-identity:ListIdentityPools",
+                    "cognito-idp:ListUserPools"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CognitoAdminRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "cognito-identity.amazonaws.com"
+              },
+              "Action": [
+                "sts:AssumeRoleWithWebIdentity",
+                "sts:TagSession"
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "cognito-identity.amazonaws.com:aud": {
+                    "Ref": "IdentityPoolId"
+                  }
+                },
+                "ForAnyValue:StringLike": {
+                  "cognito-identity.amazonaws.com:amr": "authenticated"
+                }
+              }
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Sub": "Cognito_${CognitoDomainName}-identitypool_Admin_Role"
+            },
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "es:*"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CognitoReadOnlyRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "cognito-identity.amazonaws.com"
+              },
+              "Action": [
+                "sts:AssumeRoleWithWebIdentity",
+                "sts:TagSession"
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "cognito-identity.amazonaws.com:aud": {
+                    "Ref": "IdentityPoolId"
+                  }
+                },
+                "ForAnyValue:StringLike": {
+                  "cognito-identity.amazonaws.com:amr": "authenticated"
+                }
+              }
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Sub": "Cognito_${CognitoDomainName}-identitypool_Read_Role"
+            },
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "es:ESHttpGet"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CognitoDenyRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "cognito-identity.amazonaws.com"
+              },
+              "Action": [
+                "sts:AssumeRoleWithWebIdentity",
+                "sts:TagSession"
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "cognito-identity.amazonaws.com:aud": {
+                    "Ref": "IdentityPoolId"
+                  }
+                },
+                "ForAnyValue:StringLike": {
+                  "cognito-identity.amazonaws.com:amr": "uauthenticated"
+                }
+              }
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Sub": "Cognito_${CognitoDomainName}-identitypool_Read_Role"
+            },
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Deny",
+                  "Action": [
+                    "es:*"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "UserPoolDomain": {
+      "Type": "AWS::Cognito::UserPoolDomain",
+      "DependsOn": "UserPoolId",
+      "Properties": {
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        },
+        "Domain": {
+          "Ref": "CognitoDomainName"
+        }
+      }
+    },
+    "UserPoolId": {
+      "Type": "AWS::Cognito::UserPool",
+      "Properties": {
+        "UserPoolName": {
+          "Fn::Sub": "${CognitoDomainName}-userpool"
+        },
+        "AutoVerifiedAttributes": [
+          "email"
+        ],
+        "AdminCreateUserConfig": {
+          "AllowAdminCreateUserOnly": true,
+          "InviteMessageTemplate": {
+            "EmailMessage": "Your Kibana username is {username} and the temporary password is {####}",
+            "EmailSubject": "Kibana username and temporary password"
+          }
+        },
+        "Policies": {
+          "PasswordPolicy": {
+            "MinimumLength": 8,
+            "RequireLowercase": true,
+            "RequireNumbers": true,
+            "RequireSymbols": true,
+            "RequireUppercase": true,
+            "TemporaryPasswordValidityDays": 7
+          }
+        }
+      }
+    },
+    "UserPoolClient": {
+      "Type": "AWS::Cognito::UserPoolClient",
+      "DependsOn": "UserPoolId",
+      "Properties": {
+        "ClientName": {
+          "Fn::Sub": "${CognitoDomainName}-userpoolclient"
+        },
+        "GenerateSecret": false,
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        }
+      }
+    },
+    "IdentityPoolId": {
+      "Type": "AWS::Cognito::IdentityPool",
+      "DependsOn": [
+        "UserPoolId",
+        "UserPoolClient"
+      ],
+      "Properties": {
+        "IdentityPoolName": {
+          "Fn::Sub": "${CognitoDomainName}-identitypool"
+        },
+        "AllowUnauthenticatedIdentities": true,
+        "CognitoIdentityProviders": [
+          {
+            "ClientId": {
+              "Ref": "UserPoolClient"
+            },
+            "ProviderName": {
+              "Fn::GetAtt": [
+                "UserPoolId",
+                "ProviderName"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "IdentityPoolRoleAttachment": {
+      "Type": "AWS::Cognito::IdentityPoolRoleAttachment",
+      "Properties": {
+        "IdentityPoolId": {
+          "Ref": "IdentityPoolId"
+        },
+        "Roles": {
+          "authenticated": {
+            "Fn::GetAtt": [
+              "CognitoAdminRole",
+              "Arn"
+            ]
+          },
+          "unauthenticated": {
+            "Fn::GetAtt": [
+              "CognitoDenyRole",
+              "Arn"
+            ]
+          }
+        },
+        "RoleMappings": {
+          "userpool1": {
+            "IdentityProvider": {
+              "Fn::Join": [
+                ":",
+                [
+                  {
+                    "Fn::GetAtt": [
+                      "UserPoolId",
+                      "ProviderName"
+                    ]
+                  },
+                  {
+                    "Ref": "UserPoolClient"
+                  }
+                ]
+              ]
+            },
+            "AmbiguousRoleResolution": "Deny",
+            "Type": "Rules",
+            "RulesConfiguration": {
+              "Rules": [
+                {
+                  "Claim": "cognito:username",
+                  "MatchType": "Equals",
+                  "RoleARN": {
+                    "Fn::GetAtt": [
+                      "CognitoAdminRole",
+                      "Arn"
+                    ]
+                  },
+                  "Value": "admin"
+                },
+                {
+                  "Claim": "cognito:username",
+                  "MatchType": "Equals",
+                  "RoleARN": {
+                    "Fn::GetAtt": [
+                      "CognitoReadOnlyRole",
+                      "Arn"
+                    ]
+                  },
+                  "Value": "readonly"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "adminUser": {
+      "Type": "AWS::Cognito::UserPoolUser",
+      "DependsOn": "UserPoolId",
+      "Properties": {
+        "Username": "admin",
+        "DesiredDeliveryMediums": [
+          "EMAIL"
+        ],
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        },
+        "UserAttributes": [
+          {
+            "Name": "email",
+            "Value": {
+              "Ref": "AdminEmail"
+            }
+          }
+        ]
+      }
+    },
+    "readonlyUser": {
+      "Type": "AWS::Cognito::UserPoolUser",
+      "DependsOn": "UserPoolId",
+      "Properties": {
+        "Username": "readonly",
+        "DesiredDeliveryMediums": [
+          "EMAIL"
+        ],
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        },
+        "UserAttributes": [
+          {
+            "Name": "email",
+            "Value": {
+              "Ref": "readonlyEmail"
+            }
+          }
+        ]
+      }
+    },
+    "adminUserGroup": {
+      "Type": "AWS::Cognito::UserPoolGroup",
+      "DependsOn": "UserPoolId",
+      "Properties": {
+        "GroupName": "AdminGroup",
+        "Precedence": 0,
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "CognitoAdminRole",
+            "Arn"
+          ]
+        },
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        }
+      }
+    },
+    "readonlyGroup": {
+      "Type": "AWS::Cognito::UserPoolGroup",
+      "DependsOn": "UserPoolId",
+      "Properties": {
+        "GroupName": "ReadonlyGroup",
+        "Precedence": 10,
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "CognitoReadOnlyRole",
+            "Arn"
+          ]
+        },
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        }
+      }
+    },
+    "AdminGroupAssignment": {
+      "Type": "AWS::Cognito::UserPoolUserToGroupAttachment",
+      "DependsOn": [
+        "UserPoolId",
+        "adminUserGroup"
+      ],
+      "Properties": {
+        "GroupName": {
+          "Ref": "adminUserGroup"
+        },
+        "Username": "admin",
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        }
+      }
+    },
+    "ReadonlyGroupAssignment": {
+      "Type": "AWS::Cognito::UserPoolUserToGroupAttachment",
+      "DependsOn": [
+        "UserPoolId",
+        "readonlyGroup"
+      ],
+      "Properties": {
+        "GroupName": {
+          "Ref": "readonlyGroup"
+        },
+        "Username": "readonly",
+        "UserPoolId": {
+          "Ref": "UserPoolId"
+        }
+      }
+    },
+    "LambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "lambda.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": "Cloudwatch_Lambda_Role",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Action": [
+                    "es:*"
+                  ],
+                  "Effect": "Allow",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:CreateLogGroup",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "LambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": [
+        "LambdaRole",
+        "ElasticsearchDomain"
+      ],
+      "Properties": {
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "LambdaRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "LambdaArtifactBucketName"
+          },
+          "S3Key": {
+            "Ref": "LambdaArtifactName"
+          }
+        },
+        "Runtime": "nodejs12.x",
+        "Timeout": 120,
+        "MemorySize": "150",
+        "Environment": {
+          "Variables": {
+            "ES_DNS": {
+              "Fn::GetAtt": [
+                "ElasticsearchDomain",
+                "DomainEndpoint"
+              ]
+            },
+            "INDEX": {
+              "Ref": "indexName"
+            }
+          }
+        }
+      }
+    },
+    "LambdaInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "DependsOn": "LambdaFunction",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "LambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": {
+          "Fn::Sub": "logs.${AWS::Region}.amazonaws.com"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudwatchLogGroup}:*"
+        },
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        }
+      }
+    },
+    "LogSubscriptionFilter": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "DependsOn": "LambdaInvokePermission",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "CloudwatchLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "LambdaFunction",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "ElasticsearchDomain": {
+      "Type": "AWS::Elasticsearch::Domain",
+      "Properties": {
+        "DomainName": {
+          "Ref": "ESDomainName"
+        },
+        "ElasticsearchVersion": {
+          "Ref": "ElasticsearchVersion"
+        },
+        "ElasticsearchClusterConfig": {
+          "DedicatedMasterEnabled": "true",
+          "InstanceCount": {
+            "Ref": "DataNodeCount"
+          },
+          "ZoneAwarenessEnabled": "true",
+          "InstanceType": {
+            "Ref": "DataNodeInstanceType"
+          },
+          "DedicatedMasterType": {
+            "Ref": "MasterNodeInstanceType"
+          },
+          "DedicatedMasterCount": {
+            "Ref": "MasterNodeCount"
+          }
+        },
+        "EBSOptions": {
+          "EBSEnabled": true,
+          "Iops": {
+            "Ref": "IOPS"
+          },
+          "VolumeSize": {
+            "Ref": "EBSVol"
+          },
+          "VolumeType": "gp2"
+        },
+        "SnapshotOptions": {
+          "AutomatedSnapshotStartHour": "0"
+        },
+        "CognitoOptions": {
+          "Enabled": true,
+          "IdentityPoolId": {
+            "Ref": "IdentityPoolId"
+          },
+          "RoleArn": {
+            "Fn::GetAtt": [
+              "CognitoAuthRole",
+              "Arn"
+            ]
+          },
+          "UserPoolId": {
+            "Ref": "UserPoolId"
+          }
+        },
+        "AccessPolicies": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:aws:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": "es:*",
+              "Resource": {
+                "Fn::Sub": "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*"
+              }
+            }
+          ]
+        },
+        "AdvancedOptions": {
+          "rest.action.multi.allow_explicit_index": "true"
+        },
+        "EncryptionAtRestOptions": {
+          "Enabled": true
+        },
+        "NodeToNodeEncryptionOptions": {
+          "Enabled": true
+        },
+        "DomainEndpointOptions": {
+          "EnforceHTTPS": true
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "AdminUserName": {
+      "Value": "admin"
+    },
+    "ReadOnlyUserName": {
+      "Value": "readonly"
+    },
+    "ElasticsearchDNS": {
+      "Value": {
+        "Fn::GetAtt": [
+          "ElasticsearchDomain",
+          "DomainEndpoint"
+        ]
+      }
+    },
+    "KibanaDNS": {
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            {
+              "Fn::GetAtt": [
+                "ElasticsearchDomain",
+                "DomainEndpoint"
+              ]
+            },
+            "_plugin/kibana/"
+          ]
+        ]
+      }
+    },
+    "LambdaFunctionName": {
+      "Value": {
+        "Fn::Sub": "$(CloudwatchLogGroup)_$(ESDomainName)_Function"
+      }
+    }
+  }
+}
